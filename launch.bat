@@ -48,5 +48,5 @@ GOTO :migration_launch_script
 call "%~dp0\venv\Scripts\activate"
 "%~dp0\venv\Scripts\python" -m pip install -r "%~dp0\Python\requirements.txt"
 echo Executing Migration Script...
-"%~dp0\venv\Scripts\python" "%~dp0\Python\main.py"
+"%~dp0\venv\Scripts\python" "%~dp0\Python\parse_sections.py" %~dp0conversations.json
 pause

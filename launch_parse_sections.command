@@ -46,7 +46,7 @@ pip install -r "$SCRIPT_DIR/Python/requirements.txt"
 
 # Launch the main script
 echo "Executing Migration Script"
-python "$SCRIPT_DIR/Python/parse_sections.py" $SCRIPT_DIR/conversations.json --clean
+python "$SCRIPT_DIR/Python/parse_sections.py" $SCRIPT_DIR/conversations.json --clean --lm --lm-only
 
 deactivate
 echo "Script execution complete."

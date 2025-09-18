@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import re
 import os
 from pathlib import Path
@@ -7,12 +8,14 @@ import time
 import sys
 import shutil
 
+
 def sanitize_filename(filename):
     # Remove backticks and spaces
     filename = filename.replace('`', '').strip()
     # Replace spaces with underscores
     filename = filename.replace(' ', '_')
     return filename
+
 
 def find_code_blocks_recursive(obj, found_blocks=None, debug=False):
     if found_blocks is None:
@@ -37,12 +40,14 @@ def find_code_blocks_recursive(obj, found_blocks=None, debug=False):
                     print(f"[DEBUG] Found code block (lang={language}): [EMPTY BLOCK]")
     return found_blocks
 
-def parse_conversations(conversations_file, target_conversation_id=None, keywords=None, min_lines=None):
+
+def parse_conversations(conversations_file, target_conversation_id=None, keywords=None, min_lines=None,
+                        write_lm_json=False, lm_only=False):
     # Read the conversations file
     with open(conversations_file, 'r', encoding='utf-8') as f:
         conversations = json.load(f)
     print(f"Loaded {len(conversations)} conversations from {conversations_file}")
-    
+
     # Filter conversations if target_conversation_id is provided
     if target_conversation_id:
         conversations = [conv for conv in conversations if conv.get('id') == target_conversation_id]
@@ -68,11 +73,11 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
                                         content += part['text'].lower()
                             elif isinstance(msg['content'], str):
                                 content += msg['content'].lower()
-            
+
             # Check if any keyword is in either title or content
             if any(keyword.lower() in title or keyword.lower() in content for keyword in keywords):
                 filtered_conversations.append(conv)
-        
+
         conversations = filtered_conversations
         print(f"Matched {len(conversations)} conversations with keywords {keywords} in title or content")
         if conversations:
@@ -83,22 +88,25 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
             print("No conversations matched the provided keywords.")
     else:
         print(f"Processing all {len(conversations)} conversations")
-    
+
     if not conversations:
         print("No conversations to process after filtering.")
         return
 
+    # Base output directory
+    base_output_dir = Path('parsed_sections')
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
     # Process each conversation
     for conversation in conversations:
         conversation_id = conversation.get('id', 'unknown')
-        mapping = conversation.get('mapping', {})
+        mapping = conversation.get('mapping', {}) or {}
         print(f"Processing conversation {conversation_id} with {len(mapping)} mapping entries")
-        
+
         # Create conversation-specific directory
-        base_output_dir = Path('parsed_sections')
         conv_dir = base_output_dir / conversation_id
         conv_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Create a manifest file to track all extracted files
         manifest = {
             'extraction_date': datetime.now().isoformat(),
@@ -107,7 +115,25 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
             'extracted_files': []
         }
 
-        # Process each message in the conversation
+        # If requested, assemble LM-style JSON for the whole conversation
+        if write_lm_json:
+            conv_json = assemble_conversation_json(conversation, min_lines=min_lines)
+            lm_file = conv_dir / f"{conversation_id}.json"
+            with open(lm_file, 'w', encoding='utf-8') as f:
+                json.dump(conv_json, f, ensure_ascii=False, indent=2)
+            print(f"Wrote LM-style conversation JSON to {lm_file} ({len(conv_json['messages'])} messages)")
+
+        # If lm_only is True, skip per-message extraction
+        if lm_only and write_lm_json:
+            print("Skipping per-message extraction due to --lm-only")
+            # still write an empty manifest so caller can see it exists (optional)
+            manifest_file = conv_dir / 'extraction_manifest.json'
+            with open(manifest_file, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, indent=2)
+            print(f"Manifest saved to: {manifest_file} (no per-message files created)")
+            continue
+
+        # Process each message in the conversation (original extraction behavior)
         message_count = 0
         for msg_id, entry in mapping.items():
             if 'message' in entry and entry['message']:
@@ -117,7 +143,13 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
                     if message_count < 3:
                         print(f"\nMessage {message_count} structure:")
                         print(f"Content type: {type(msg['content'])}")
-                        print(f"Content keys: {getattr(msg['content'], 'keys', lambda: [])()}")
+                        try:
+                            if isinstance(msg['content'], dict):
+                                print(f"Content keys: {list(msg['content'].keys())}")
+                            else:
+                                print("Content keys: N/A")
+                        except Exception:
+                            pass
                         print(f"Content value: {repr(msg['content'])[:500]}")
                     # Now handle if content is a dict
                     if isinstance(msg['content'], dict):
@@ -127,7 +159,8 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
                                 if isinstance(part, str):
                                     message_count += 1
                                     content = part
-                                    filename = extract_filename_from_content(content) or f'message_{msg_id}_{message_count}.txt'
+                                    filename = extract_filename_from_content(
+                                        content) or f'message_{msg_id}_{message_count}.txt'
                                     if min_lines is None or len(content.splitlines()) > min_lines:
                                         print(f"Saving content to {filename}")
                                         save_section(conv_dir, filename, content, manifest)
@@ -138,16 +171,33 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
                             if min_lines is None or len(content.splitlines()) > min_lines:
                                 print(f"Saving content to {filename}")
                                 save_section(conv_dir, filename, content, manifest)
+                        else:
+                            # attempt to find strings inside nested content dict
+                            nested_texts = find_code_blocks_recursive(msg['content'])
+                            for lang, section_content in nested_texts:
+                                message_count += 1
+                                filename = extract_codeblock_filename(section_content, lang)
+                                if min_lines is None or len(section_content.splitlines()) > min_lines:
+                                    save_section(conv_dir, filename, section_content, manifest)
                     elif isinstance(msg['content'], list):
                         for part in msg['content']:
                             if isinstance(part, dict):
                                 if 'text' in part:
                                     message_count += 1
                                     content = part['text']
-                                    filename = extract_filename_from_content(content) or f'message_{msg_id}_{message_count}.txt'
+                                    filename = extract_filename_from_content(
+                                        content) or f'message_{msg_id}_{message_count}.txt'
                                     if min_lines is None or len(content.splitlines()) > min_lines:
                                         print(f"Saving content to {filename}")
                                         save_section(conv_dir, filename, content, manifest)
+                            elif isinstance(part, str):
+                                message_count += 1
+                                content = part
+                                filename = extract_filename_from_content(
+                                    content) or f'message_{msg_id}_{message_count}.txt'
+                                if min_lines is None or len(content.splitlines()) > min_lines:
+                                    print(f"Saving content to {filename}")
+                                    save_section(conv_dir, filename, content, manifest)
                     elif isinstance(msg['content'], str):
                         message_count += 1
                         content = msg['content']
@@ -155,23 +205,31 @@ def parse_conversations(conversations_file, target_conversation_id=None, keyword
                         if min_lines is None or len(content.splitlines()) > min_lines:
                             print(f"Saving content to {filename}")
                             save_section(conv_dir, filename, content, manifest)
-        
+
         # Save the manifest
         manifest_file = conv_dir / 'extraction_manifest.json'
         with open(manifest_file, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
-        
+
         print(f"Conversation {conversation_id}: {len(manifest['extracted_files'])} files extracted.")
         print(f"Manifest saved to: {manifest_file}")
+
 
 def extract_glyph_title(section_content):
     # Look for a line like glyph_title = "Some Title"
     lines = section_content.splitlines()
     for line in lines[:10]:  # Only scan the first 10 lines
-        match = re.search(r'glyph_title\s*=\s*["\\\']([^"\\\']+)["\\\']', line)
+        match = re.search(r'glyph_title\s*=\s*["\
+\
+\']([^"\
+\
+\']+)["\
+\
+\']', line)
         if match:
             return sanitize_filename(match.group(1))
     return None
+
 
 def extract_codeblock_filename(section_content, language):
     lines = section_content.splitlines()
@@ -185,13 +243,16 @@ def extract_codeblock_filename(section_content, language):
     # Check for a title pattern in the first line
     if lines:
         first_line = lines[0].strip()
-        title_match = re.match(r'^[^\n]*?([\w\-\.]+\.(?:txt|md|py|json|yaml|sh|bash|shell|latex|markdown))(?:\s*[—–-]\s*[^\n]*)?$', first_line)
+        title_match = re.match(
+            r'^[^\n]*?([\w\-\.]+\.(?:txt|md|py|json|yaml|sh|bash|shell|latex|markdown))(?:\s*[—–-]\s*[^\n]*)?$',
+            first_line)
         if title_match:
             print(f'[FILENAME DEBUG] Using title filename: {title_match.group(1)} from first line: {first_line}')
             return sanitize_filename(title_match.group(1))
         transmission_match = re.match(r'^[^\n]*?(transmission_\d+\.txt)(?:\s*[—–-]\s*[^\n]*)?$', first_line)
         if transmission_match:
-            print(f'[FILENAME DEBUG] Using transmission filename: {transmission_match.group(1)} from first line: {first_line}')
+            print(
+                f'[FILENAME DEBUG] Using transmission filename: {transmission_match.group(1)} from first line: {first_line}')
             return sanitize_filename(transmission_match.group(1))
     glyph_title = extract_glyph_title(section_content)
     if glyph_title:
@@ -201,34 +262,35 @@ def extract_codeblock_filename(section_content, language):
     print(f'[FILENAME DEBUG] Fallback to timestamp for first line: {debug_line}')
     return f'code_block_{timestamp}_{language}.txt'
 
+
 def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
     processed_files = set()
-    
+
     # Pattern 1: ### 📄 `filename.txt`
     pattern1 = r'### 📄 `([^`]+)`\s*\n(.*?)(?=\n### 📄|$)'
-    
+
     # Pattern 2: ```path=filename
     pattern2 = r'```path=([^\n]+)\n(.*?)(?=```|$)'
-    
+
     # Pattern 3: ```language
     pattern3 = r'```(\w+)\n(.*?)(?=```|$)'
-    
+
     # Pattern 4: ### 📄 filename.md
     pattern4 = r'### 📄 ([^\n]+)\s*\n(.*?)(?=\n### 📄|$)'
-    
+
     # Pattern 5: ### 📄 filename (without backticks)
     pattern5 = r'### �� ([^\n`]+)\s*\n(.*?)(?=\n### 📄|$)'
-    
+
     # Pattern 6: Code window with language and path
     pattern6 = r'```(\w+)\s*path=([^\n]+)\n(.*?)(?=```|$)'
-    
+
     # Pattern 7: Image with alt text and path
     pattern7 = r'!\[([^\]]*)\]\(([^)]+)\)'
-    
+
     # Pattern 8: Improved Section blocks like SECTION 28
     # Allow any text after opening triple backticks, match SECTION <number>: in first 5 lines
     pattern8 = r'```[\s\S]*?(SECTION\s*(\d+):\s*([^\n]+)\n)([\s\S]*?)(?:— END OF SECTION \2 —|```|$)'
-    
+
     # Helper to check line count
     def passes_min_lines(section_content):
         if min_lines is None:
@@ -242,7 +304,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if filename not in processed_files and passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 2
     for match in re.finditer(pattern2, content, re.DOTALL):
         filename = sanitize_filename(match.group(1).strip())
@@ -250,7 +312,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if filename not in processed_files and passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 3
     for match in re.finditer(pattern3, content, re.DOTALL):
         language = match.group(1).strip()
@@ -259,7 +321,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 4
     for match in re.finditer(pattern4, content, re.DOTALL):
         filename = sanitize_filename(match.group(1).strip())
@@ -267,7 +329,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if filename not in processed_files and passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 5
     for match in re.finditer(pattern5, content, re.DOTALL):
         filename = sanitize_filename(match.group(1).strip())
@@ -275,7 +337,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if filename not in processed_files and passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 6 (Code windows with path)
     for match in re.finditer(pattern6, content, re.DOTALL):
         language = match.group(1).strip()
@@ -286,7 +348,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if filename not in processed_files and passes_min_lines(section_content):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
-    
+
     # Process Pattern 7 (Images)
     for match in re.finditer(pattern7, content, re.DOTALL):
         alt_text = match.group(1).strip()
@@ -302,7 +364,7 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
         if metadata_filename not in processed_files:
             save_section(output_dir, metadata_filename, json.dumps(metadata, indent=2), manifest)
             processed_files.add(metadata_filename)
-    
+
     # Process Pattern 8 (Section blocks)
     for match in re.finditer(pattern8, content, re.IGNORECASE):
         section_num = match.group(2)
@@ -314,32 +376,34 @@ def parse_content_with_patterns(content, output_dir, manifest, min_lines=None):
             save_section(output_dir, filename, section_content, manifest)
             processed_files.add(filename)
 
+
 def parse_sections(input_file):
     # Read the input file
     with open(input_file, 'r', encoding='utf-8') as f:
         content = f.read()
-    
+
     # Create output directory
     output_dir = Path('parsed_sections')
     output_dir.mkdir(exist_ok=True)
-    
+
     # Create a manifest file to track all extracted files
     manifest = {
         'extraction_date': datetime.now().isoformat(),
         'source_file': input_file,
         'extracted_files': []
     }
-    
+
     # Parse using existing patterns
     parse_content_with_patterns(content, output_dir, manifest)
-    
+
     # Save the manifest
     manifest_file = output_dir / 'extraction_manifest.json'
     with open(manifest_file, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2)
-    
+
     print(f"\nExtraction complete. {len(manifest['extracted_files'])} files extracted.")
     print(f"Manifest saved to: {manifest_file}")
+
 
 def save_section(output_dir, filename, content, manifest):
     try:
@@ -348,7 +412,7 @@ def save_section(output_dir, filename, content, manifest):
         if len(lines) >= 3 and '"""' in lines[0] and '"""' in lines[-1]:
             # Extract the actual content between the triple quotes
             content = '\n'.join(lines[1:-1])
-        
+
         # Create subdirectories if needed
         file_path = Path(filename)
         if len(file_path.parts) > 1:
@@ -357,22 +421,23 @@ def save_section(output_dir, filename, content, manifest):
             output_file = output_dir / filename
         else:
             output_file = output_dir / filename
-        
+
         # Write the content (will overwrite if file exists)
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(content)
-        
+
         # Update manifest
         manifest['extracted_files'].append({
             'filename': str(output_file),
             'size': len(content),
             'extracted_at': datetime.now().isoformat()
         })
-        
+
         print(f"Created/Updated {output_file}")
-        
+
     except Exception as e:
         print(f"Error processing {filename}: {str(e)}")
+
 
 def extract_filename_from_content(content):
     # First check if this is a code block with a string literal
@@ -381,11 +446,11 @@ def extract_filename_from_content(content):
         # This is likely a code block with a string literal
         # Extract the actual content between the triple quotes
         content = '\n'.join(lines[1:-1])
-    
+
     # Check the first 5 non-empty lines for a filename or section header
     for line in content.splitlines()[:5]:
         line = line.strip().strip('"`')
-        
+
         # Match section header pattern with "SECTION" and number
         section_match = re.match(r'([A-Z0-9\s\-—:]+)', line)
         if section_match and 'SECTION' in line and ':' in line:
@@ -397,12 +462,12 @@ def extract_filename_from_content(content):
                 # Convert to filename format
                 filename = f'section_{section_num}_{sanitize_filename(section_title)}.txt'
                 return filename
-        
+
         # Match filename patterns
         match = re.match(r'([\w\-]+\.(txt|md|py|json|yaml|sh|bash|shell|latex|markdown))', line, re.IGNORECASE)
         if match:
             return sanitize_filename(match.group(1))
-            
+
         # Match section header without number
         if 'SECTION' in line:
             # Convert to lower case, replace spaces and dashes with single dash, remove non-alphanum except dash
@@ -413,7 +478,7 @@ def extract_filename_from_content(content):
             filename = re.sub(r'-+', '-', filename)
             filename = filename.strip('-') + '.txt'
             return filename
-    
+
     # Fallback: Look for Markdown bold/italic titles in the first 10 lines
     for line in content.splitlines()[:10]:
         # Match **— Title —** or **Title** or *Title*
@@ -426,18 +491,113 @@ def extract_filename_from_content(content):
             filename = sanitize_filename(title.lower().replace(' ', '_').replace('-', '_')) + '.txt'
             filename = re.sub(r'[^a-z0-9_]', '', filename)
             return filename
-    
+
     return None
+
+
+# ----------------- LM Assembler helpers -----------------
+
+def infer_role_from_message(msg):
+    # Typical chat export has message['author']['role'] e.g. 'user' or 'assistant'
+    role = None
+    if isinstance(msg, dict):
+        author = msg.get('author')
+        if isinstance(author, dict):
+            role = author.get('role')
+            if isinstance(role, str):
+                return role.lower()
+        # sometimes role stored in top-level keys
+        r = msg.get('role') or msg.get('speaker') or msg.get('from')
+        if isinstance(r, str):
+            return r.lower()
+    return None
+
+
+def extract_texts_from_message(msg):
+    """
+    Return a list of text parts for this message (usually single part).
+    Handles: msg['content'] as dict with 'parts', as list, or as string.
+    """
+    texts = []
+    if not msg:
+        return texts
+    content = msg.get('content') if isinstance(msg, dict) else None
+    # direct content dict with 'parts' (OpenAI/ChatGPT export common)
+    if isinstance(content, dict):
+        parts = content.get('parts')
+        if isinstance(parts, list):
+            for p in parts:
+                if isinstance(p, str):
+                    texts.append(p)
+                elif isinstance(p, dict):
+                    # sometimes ChatGPT stores parts as dicts with 'text'
+                    t = p.get('text') or p.get('content') or p.get('payload')
+                    if isinstance(t, str):
+                        texts.append(t)
+        # fallback to 'text' key
+        elif isinstance(content.get('text'), str):
+            texts.append(content.get('text'))
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                if 'text' in part and isinstance(part['text'], str):
+                    texts.append(part['text'])
+            elif isinstance(part, str):
+                texts.append(part)
+    elif isinstance(content, str):
+        texts.append(content)
+    # Also handle older/different shape where the message itself is a string
+    elif isinstance(msg, str):
+        texts.append(msg)
+    return texts
+
+
+def assemble_conversation_json(conversation, min_lines=None):
+    conv_id = conversation.get('id', 'unknown')
+    title = conversation.get('title', '')
+    mapping = conversation.get('mapping', {}) or {}
+    messages = []
+
+    # Respect insertion order in mapping; if timestamps available, you might sort by them
+    for idx, (msg_id, entry) in enumerate(mapping.items()):
+        if not entry or 'message' not in entry or not entry['message']:
+            continue
+        msg_obj = entry['message']
+        role = infer_role_from_message(msg_obj) or infer_role_from_message(entry) or 'user'
+        parts = extract_texts_from_message(msg_obj)
+        if not parts:
+            # fallback: sometimes content is directly on message as 'content'
+            if isinstance(msg_obj.get('content'), str):
+                parts = [msg_obj.get('content')]
+        for part in parts:
+            if min_lines is None or len(part.splitlines()) > (min_lines or 0):
+                messages.append({'role': role, 'content': part})
+    return {
+        'id': conv_id,
+        'title': title,
+        'messages': messages
+    }
+
+
+# ----------------- End LM helpers -----------------
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Parse sections from conversations or files.")
     parser.add_argument('conversations_file', help='Path to conversations.json')
     parser.add_argument('--id', help='Specific conversation ID to process')
     parser.add_argument('--keywords', nargs='*', help='Keywords to filter conversation titles')
     parser.add_argument('--clean', action='store_true', help='Delete parsed_sections before extracting')
     parser.add_argument('--min-lines', type=int, help='Only extract sections longer than this many lines')
+    parser.add_argument('--lm', action='store_true', help='Also write one LM-Studio–friendly JSON per conversation')
+    parser.add_argument('--lm-only', action='store_true',
+                        help='Write only LM JSON and skip per-message extraction (requires --lm)')
     args = parser.parse_args()
+
+    if args.lm_only and not args.lm:
+        print("Warning: --lm-only specified without --lm. --lm-only implies --lm; enabling --lm.")
+        args.lm = True
 
     if args.clean:
         outdir = Path('parsed_sections')
@@ -449,7 +609,9 @@ if __name__ == "__main__":
         args.conversations_file,
         target_conversation_id=args.id,
         keywords=args.keywords,
-        min_lines=args.min_lines
+        min_lines=args.min_lines,
+        write_lm_json=args.lm,
+        lm_only=args.lm_only
     )
 else:
     print('name not main')

@@ -2,15 +2,12 @@
 """
 lm_export.py
 
-Reads a ChatGPT-style conversations.json (array of conversations) and writes
-LM Studio-compatible conversation files named <createdAt_ms>.conversation.json.
+Exports ChatGPT conversations.json (array) -> LM Studio format.
+Also normalizes already-LM-shaped files (messages present).
 
-Options:
-  --id <conversation_id>       Process only that conversation (optional)
-  --keywords <kw1> <kw2> ...   Process only conversations matching any keyword
-  --clean                      Remove output directory before running
-  --lm-only                    Write LM Studio files only (no other extraction)
-  --outdir <path>              Output directory (default: lm_conversations_lmstudio)
+Usage:
+  python lm_export.py conversations.json --clean
+  python lm_export.py conversations.json --id <conv-id> --keywords foo bar --verbose
 """
 import json
 from pathlib import Path
@@ -20,240 +17,386 @@ from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
 
 def to_millis(ts: Optional[float]) -> int:
-    """Convert timestamp in seconds (float) or milliseconds (int/float) to ms int."""
     if ts is None:
         return int(round(datetime.now().timestamp() * 1000))
     try:
         tsf = float(ts)
     except Exception:
         return int(round(datetime.now().timestamp() * 1000))
-    # if clearly already in milliseconds (big number), keep as int
-    if tsf > 1e12:
-        return int(tsf)
-    return int(round(tsf * 1000))
+    return int(tsf) if tsf > 1e12 else int(round(tsf * 1000))
 
-def text_from_content_obj(content_obj: Any) -> str:
+def text_from_content_obj(content_obj: Any, max_len: int = 2_000_000) -> str:
     """
-    Extract plain text from a ChatGPT-style content object.
-    Handles:
-      - {"content_type":"text","parts":["...","..."]}
-      - {"text":"..."}
-      - list of dicts with 'text'
-      - a simple string
-    Returns a joined string (parts separated by two newlines).
+    Robust, non-recursive collector with size guard to avoid hangs.
+    Collects strings from chatgpt content shapes and joins with double newlines.
     """
-    if content_obj is None:
-        return ""
-    if isinstance(content_obj, str):
-        return content_obj.strip()
-    if isinstance(content_obj, dict):
-        # Common ChatGPT shape
-        if 'parts' in content_obj and isinstance(content_obj['parts'], list):
-            parts = [p for p in content_obj['parts'] if isinstance(p, str) and p.strip() != ""]
-            return "\n\n".join([p.strip() for p in parts])
-        if 'text' in content_obj and isinstance(content_obj['text'], str):
-            return content_obj['text'].strip()
-        # Generic recursive collection
-        collected = []
-        def collect(obj):
-            if isinstance(obj, str):
-                if obj.strip():
-                    collected.append(obj.strip())
-            elif isinstance(obj, dict):
+    stack = [content_obj]
+    out_parts: List[str] = []
+    seen = 0
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        if isinstance(obj, str):
+            s = obj.strip()
+            if s:
+                out_parts.append(s)
+                seen += len(s)
+        elif isinstance(obj, dict):
+            # Common ChatGPT shape
+            if 'parts' in obj and isinstance(obj['parts'], list):
+                for p in reversed(obj['parts']):
+                    stack.append(p)
+            elif 'text' in obj and isinstance(obj['text'], str):
+                s = obj['text'].strip()
+                if s:
+                    out_parts.append(s)
+                    seen += len(s)
+            else:
                 for v in obj.values():
-                    collect(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    collect(it)
-        collect(content_obj)
-        return "\n\n".join(collected)
-    if isinstance(content_obj, list):
-        texts = []
-        for part in content_obj:
-            if isinstance(part, dict) and 'text' in part and isinstance(part['text'], str):
-                if part['text'].strip():
-                    texts.append(part['text'].strip())
-            elif isinstance(part, str):
-                if part.strip():
-                    texts.append(part.strip())
-        return "\n\n".join(texts)
-    return ""
+                    stack.append(v)
+        elif isinstance(obj, list):
+            for it in reversed(obj):
+                stack.append(it)
+        if seen > max_len:
+            break
+    return "\n\n".join(out_parts)
 
-def build_lmstudio_object(conversation: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a single conversation dict (with 'mapping') into LM Studio JSON shape.
-    """
+def normalize_user_single_step(text: str) -> Dict[str, Any]:
+    return {
+        "versions": [
+            {
+                "type": "singleStep",
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": text }
+                ]
+            }
+        ],
+        "currentlySelected": 0
+    }
+
+def normalize_assistant_multistep(steps_texts: List[str], sender_name: str = "") -> Dict[str, Any]:
+    steps = []
+    now_ms = to_millis(None)
+    for idx, t in enumerate(steps_texts):
+        steps.append({
+            "type": "contentBlock",
+            "stepIdentifier": f"{now_ms}-{idx}",
+            "content": [ { "type": "text", "text": t } ],
+            "defaultShouldIncludeInContext": True,
+            "shouldIncludeInContext": True
+        })
+    return {
+        "versions": [
+            {
+                "type": "multiStep",
+                "role": "assistant",
+                "steps": steps,
+                "senderInfo": { "senderName": sender_name or "" }
+            }
+        ],
+        "currentlySelected": 0
+    }
+
+def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     title = conversation.get('title') or conversation.get('name') or ""
     createdAt_ms = to_millis(conversation.get('create_time') or conversation.get('createdAt'))
+    mapping = conversation.get('mapping') or {}
 
-    lm = {
+    # Extract a system prompt if present (first visible, non-empty system msg)
+    system_prompt = ""
+    sys_candidates = []
+    for node in mapping.values():
+        msg = isinstance(node, dict) and node.get("message")
+        if isinstance(msg, dict) and (msg.get("author") or {}).get("role") == "system":
+            if not (msg.get("metadata") or {}).get("is_visually_hidden_from_conversation"):
+                t = text_from_content_obj(msg.get("content"))
+                if t.strip():
+                    sys_candidates.append((to_millis(msg.get("create_time") or 0), t))
+    if sys_candidates:
+        sys_candidates.sort(key=lambda x: x[0])
+        system_prompt = sys_candidates[0][1]
+
+    items: List[Tuple[int, str, str, Dict[str, Any]]] = []  # (ts_ms, role, text, meta)
+    for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            continue
+        msg = node.get('message')
+        if not isinstance(msg, dict):
+            continue
+        meta = msg.get('metadata') or {}
+        if meta.get('is_visually_hidden_from_conversation'):
+            continue
+        role = (msg.get('author') or {}).get('role', 'user')
+        text = text_from_content_obj(msg.get('content'))
+        if not text.strip():
+            continue
+        ts_ms = to_millis(msg.get('create_time') or 0)
+        items.append((ts_ms, role.lower() if isinstance(role, str) else 'user', text, meta))
+
+    items.sort(key=lambda x: (x[0], x[1]))
+
+    messages: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(items):
+        ts, role, text, meta = items[i]
+        if role == "user":
+            messages.append(normalize_user_single_step(text))
+            i += 1
+        elif role == "assistant":
+            # group consecutive assistant segments as one multiStep
+            steps_texts: List[str] = []
+            sender_name = meta.get("model_slug") or ""
+            while i < len(items) and items[i][1] == "assistant":
+                _, _, t2, meta2 = items[i]
+                steps_texts.append(t2)
+                if not sender_name:
+                    sender_name = meta2.get("model_slug") or ""
+                i += 1
+            messages.append(normalize_assistant_multistep(steps_texts, sender_name))
+        else:
+            # ignore other roles
+            i += 1
+
+    lm: Dict[str, Any] = {
         "name": title,
         "pinned": False,
         "createdAt": createdAt_ms,
         "preset": "",
         "tokenCount": 0,
-        "systemPrompt": conversation.get('system_prompt', "") or "",
-        "messages": [],
+        "systemPrompt": system_prompt or conversation.get("system_prompt", "") or "",
+        "messages": messages,
         "usePerChatPredictionConfig": True,
         "perChatPredictionConfig": {"fields": []},
         "clientInput": "",
         "clientInputFiles": [],
         "userFilesSizeBytes": 0,
-        "lastUsedModel": conversation.get('lastUsedModel', {}),
-        "notes": conversation.get('notes', []),
-        "plugins": conversation.get('plugins', []),
-        "pluginConfigs": conversation.get('pluginConfigs', {}),
-        "disabledPluginTools": conversation.get('disabledPluginTools', []),
-        "looseFiles": conversation.get('looseFiles', [])
+        "lastUsedModel": conversation.get("lastUsedModel", {}),
+        "notes": conversation.get("notes", []),
+        "plugins": conversation.get("plugins", []),
+        "pluginConfigs": conversation.get("pluginConfigs", {}),
+        "disabledPluginTools": conversation.get("disabledPluginTools", []),
+        "looseFiles": conversation.get("looseFiles", [])
     }
 
-    mapping = conversation.get('mapping') or {}
-    items: List[Tuple[int, str, Dict[str, Any], str]] = []  # (ts_ms, msg_id, msg_obj, text)
-
-    # collect visible messages with text and timestamp
-    for msg_id, entry in mapping.items():
-        if not isinstance(entry, dict):
-            continue
-        msg = entry.get('message')
-        if not isinstance(msg, dict):
-            continue
-        metadata = msg.get('metadata') or {}
-        # skip visually hidden messages
-        if metadata.get('is_visually_hidden_from_conversation'):
-            continue
-        content_obj = msg.get('content')
-        text = text_from_content_obj(content_obj)
-        if not text.strip():
-            # skip empty-content messages
-            continue
-        ct = msg.get('create_time') or 0
-        ts_ms = to_millis(ct)
-        items.append((ts_ms, msg_id, msg, text))
-
-    # sort messages by timestamp ascending
-    items.sort(key=lambda t: (t[0] if t[0] else 0, t[1]))
-
-    # build LM-style messages
-    for ts_ms, msg_id, msg, text in items:
-        role = (msg.get('author') or {}).get('role', 'user')
-        role = role.lower() if isinstance(role, str) else 'user'
-        if role == 'user':
-            versions = [
-                {
-                    "type": "singleStep",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text
-                        }
-                    ]
-                }
-            ]
-            lm_msg = {"versions": versions, "currentlySelected": 0}
-            lm["messages"].append(lm_msg)
+    # rough token estimate
+    approx_chars = 0
+    for m in messages:
+        v = m["versions"][0]
+        if v["type"] == "singleStep":
+            approx_chars += len(v.get("content", [{}])[0].get("text", ""))
         else:
-            # assistant or other roles
-            step = {
-                "type": "contentBlock",
-                "stepIdentifier": f"{ts_ms}-0",
-                "content": [
+            approx_chars += sum(len(s.get("content", [{}])[0].get("text", "")) for s in v.get("steps", []))
+    lm["tokenCount"] = max(approx_chars // 4, 0)
+
+    if verbose:
+        print(f"[mapping] {title!r}: messages={len(messages)} systemPrompt_len={len(lm['systemPrompt'])}")
+    return lm
+
+def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
+    """
+    Input already looks like LM JSON (has messages). We normalize shapes so LM Studio won't blank out.
+    """
+    title = conversation.get("name") or conversation.get("title") or ""
+    createdAt_ms = to_millis(conversation.get("createdAt") or conversation.get("create_time"))
+    sys_prompt = conversation.get("systemPrompt", "") or conversation.get("system_prompt", "") or ""
+
+    out_msgs: List[Dict[str, Any]] = []
+    msgs = conversation.get("messages", [])
+    for idx, m in enumerate(msgs):
+        versions = m.get("versions", [])
+        if not versions:
+            # drop empty message shells
+            continue
+        v0 = versions[0]
+        vtype = v0.get("type")
+        vrole = v0.get("role", "").lower()
+        if vtype == "singleStep" and vrole == "user":
+            content = v0.get("content") or []
+            text = ""
+            if content and isinstance(content, list) and isinstance(content[0], dict):
+                text = content[0].get("text", "")
+            elif isinstance(content, list) and content and isinstance(content[0], str):
+                text = content[0]
+            out_msgs.append(normalize_user_single_step(text or ""))
+        else:
+            # ensure it's multiStep with steps[]
+            steps = v0.get("steps") or []
+            fixed_steps = []
+            for s in steps:
+                cont = s.get("content") or []
+                text = ""
+                if cont and isinstance(cont, list) and isinstance(cont[0], dict):
+                    text = cont[0].get("text", "")
+                elif isinstance(cont, list) and cont and isinstance(cont[0], str):
+                    text = cont[0]
+                fixed_steps.append({
+                    "type": "contentBlock",
+                    "stepIdentifier": s.get("stepIdentifier") or f"{createdAt_ms}-{idx}",
+                    "content": [ { "type": "text", "text": text or "" } ],
+                    "defaultShouldIncludeInContext": True,
+                    "shouldIncludeInContext": True
+                })
+            out_msgs.append({
+                "versions": [
                     {
-                        "type": "text",
-                        "text": text
+                        "type": "multiStep",
+                        "role": "assistant",
+                        "steps": fixed_steps,
+                        "senderInfo": v0.get("senderInfo") or {"senderName": ""}
                     }
                 ],
-                "defaultShouldIncludeInContext": True,
-                "shouldIncludeInContext": True
-            }
-            versions = [
-                {
-                    "type": "multiStep",
-                    "role": "assistant",
-                    "steps": [step],
-                    "senderInfo": {"senderName": (msg.get('metadata') or {}).get('model_slug') or ""}
-                }
-            ]
-            lm_msg = {"versions": versions, "currentlySelected": 0}
-            lm["messages"].append(lm_msg)
+                "currentlySelected": 0
+            })
 
-    # tokenCount estimate (rough)
-    approx_tokens = sum(len(m['versions'][0].get('content', [{}])[0].get('text', "")) for m in lm["messages"] if m.get('versions'))
-    lm['tokenCount'] = max(approx_tokens // 4, 0)
+    lm = {
+        "name": title,
+        "pinned": bool(conversation.get("pinned", False)),
+        "createdAt": createdAt_ms,
+        "preset": conversation.get("preset", ""),
+        "tokenCount": int(conversation.get("tokenCount", 0)),
+        "systemPrompt": sys_prompt,
+        "messages": out_msgs,
+        "usePerChatPredictionConfig": bool(conversation.get("usePerChatPredictionConfig", True)),
+        "perChatPredictionConfig": conversation.get("perChatPredictionConfig", {"fields": []}),
+        "clientInput": conversation.get("clientInput", ""),
+        "clientInputFiles": conversation.get("clientInputFiles", []),
+        "userFilesSizeBytes": int(conversation.get("userFilesSizeBytes", 0)),
+        "lastUsedModel": conversation.get("lastUsedModel", {}),
+        "notes": conversation.get("notes", []),
+        "plugins": conversation.get("plugins", []),
+        "pluginConfigs": conversation.get("pluginConfigs", {}),
+        "disabledPluginTools": conversation.get("disabledPluginTools", []),
+        "looseFiles": conversation.get("looseFiles", [])
+    }
 
+    # simple token recount
+    approx_chars = 0
+    for m in lm["messages"]:
+        v = m["versions"][0]
+        if v["type"] == "singleStep":
+            approx_chars += len(v.get("content", [{}])[0].get("text", ""))
+        else:
+            approx_chars += sum(len(s.get("content", [{}])[0].get("text", "")) for s in v.get("steps", []))
+    lm["tokenCount"] = max(approx_chars // 4, 0)
+
+    if verbose:
+        print(f"[normalize] {title!r}: in_msgs={len(msgs)} out_msgs={len(out_msgs)}")
     return lm
 
 def filter_conversations(conversations: List[Dict[str, Any]], target_id: Optional[str], keywords: Optional[List[str]]) -> List[Dict[str, Any]]:
     if target_id:
-        filtered = [c for c in conversations if c.get('id') == target_id]
-        return filtered
+        return [c for c in conversations if c.get('id') == target_id]
     if not keywords:
         return conversations
     lower_kws = [k.lower() for k in keywords]
-    out = []
+    out: List[Dict[str, Any]] = []
     for c in conversations:
-        title = (c.get('title') or "").lower()
+        title = (c.get('title') or c.get('name') or "").lower()
         if any(kw in title for kw in lower_kws):
             out.append(c)
             continue
-        # search content quickly
+        # quick content scan (mapping only)
         mapping = c.get('mapping') or {}
-        concat = ""
+        blob = ""
         for entry in mapping.values():
             if isinstance(entry, dict):
                 msg = entry.get('message')
                 if isinstance(msg, dict):
-                    content = msg.get('content')
-                    if isinstance(content, str):
-                        concat += " " + content.lower()
-                    elif isinstance(content, dict) and 'parts' in content:
-                        for p in content.get('parts', []):
+                    cnt = msg.get('content')
+                    if isinstance(cnt, str):
+                        blob += " " + cnt.lower()
+                    elif isinstance(cnt, dict) and 'parts' in cnt:
+                        for p in cnt.get('parts', []):
                             if isinstance(p, str):
-                                concat += " " + p.lower()
-                    elif isinstance(content, list):
-                        for p in content:
-                            if isinstance(p, dict) and 'text' in p:
-                                concat += " " + p.get('text', "").lower()
-        if any(kw in concat for kw in lower_kws):
+                                blob += " " + p.lower()
+                    elif isinstance(cnt, list):
+                        for p in cnt:
+                            if isinstance(p, dict) and isinstance(p.get('text'), str):
+                                blob += " " + p['text'].lower()
+        if any(kw in blob for kw in lower_kws):
             out.append(c)
     return out
 
 def main():
-    parser = argparse.ArgumentParser(description="Export conversations.json to LM Studio formatted files.")
-    parser.add_argument('conversations_file', help='Path to conversations.json (array of conversations)')
-    parser.add_argument('--id', help='Process only conversation with this ID')
-    parser.add_argument('--keywords', nargs='*', help='Process only conversations matching these keywords (title or content)')
+    parser = argparse.ArgumentParser(description="Export/normalize conversations to LM Studio format.")
+    parser.add_argument('conversations_file', help='Path to conversations.json (array of conversations or single LM conversation)')
+    parser.add_argument('--id', help='Only process this conversation ID (when input is an array)')
+    parser.add_argument('--keywords', nargs='*', help='Only conversations containing these keywords (title or content)')
     parser.add_argument('--clean', action='store_true', help='Delete output directory before extracting')
-    parser.add_argument('--lm-only', action='store_true', help='Write only LM Studio JSON output (default behavior here)')
     parser.add_argument('--outdir', default='lm_conversations_lmstudio', help='Output directory')
+    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
     args = parser.parse_args()
 
-    conversations_path = Path(args.conversations_file)
-    if not conversations_path.exists():
-        print("Error: conversations.json not found at", conversations_path)
+    src_path = Path(args.conversations_file)
+    if not src_path.exists():
+        print("Error: not found:", src_path)
         return
 
-    with open(conversations_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-        if not isinstance(data, list):
-            print("Error: expected conversations.json to be an array of conversation objects.")
-            return
-        conversations = data
+    try:
+        data = json.loads(src_path.read_text(encoding='utf-8'))
+    except Exception as e:
+        print("Error reading JSON:", e)
+        return
 
-    conversations = filter_conversations(conversations, args.id, args.keywords)
+    # Determine if input is an array of conversations or a single LM-styled conversation
+    if isinstance(data, list):
+        conversations = filter_conversations(data, args.id, args.keywords)
+    elif isinstance(data, dict):
+        # Wrap single conversation dict to reuse loop
+        conversations = [data]
+    else:
+        print("Error: input must be a JSON array or a single conversation object.")
+        return
 
     outdir = Path(args.outdir)
     if args.clean and outdir.exists():
         shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    for conv in conversations:
-        lm_obj = build_lmstudio_object(conv)
-        # filename should be createdAt ms per LM Studio convention
-        createdAt = lm_obj.get('createdAt') or lm_obj.get('createdAt', to_millis(None))
-        filename = outdir / f"{int(createdAt)}.conversation.json"
-        filename.write_text(json.dumps(lm_obj, ensure_ascii=False, indent=2), encoding='utf-8')
-        print("Wrote", filename, "(", lm_obj.get('name', '') , ")")
+    for idx, conv in enumerate(conversations):
+        has_mapping = isinstance(conv.get("mapping"), dict)
+        has_messages = isinstance(conv.get("messages"), list)
+
+        if args.verbose:
+            name = conv.get("title") or conv.get("name") or ""
+            print(f"[{idx+1}/{len(conversations)}] title={name!r} mapping={has_mapping} messages={has_messages}")
+
+        if has_mapping:
+            lm_obj = build_from_mapping(conv, verbose=args.verbose)
+        elif has_messages:
+            lm_obj = normalize_existing_lm(conv, verbose=args.verbose)
+        else:
+            # Nothing recognizable; make a minimal empty shell so we don't hang
+            lm_obj = {
+                "name": conv.get("title") or conv.get("name") or "",
+                "pinned": False,
+                "createdAt": to_millis(conv.get("create_time") or conv.get("createdAt")),
+                "preset": "",
+                "tokenCount": 0,
+                "systemPrompt": "",
+                "messages": [],
+                "usePerChatPredictionConfig": True,
+                "perChatPredictionConfig": {"fields": []},
+                "clientInput": "",
+                "clientInputFiles": [],
+                "userFilesSizeBytes": 0,
+                "lastUsedModel": {},
+                "notes": [],
+                "plugins": [],
+                "pluginConfigs": {},
+                "disabledPluginTools": [],
+                "looseFiles": []
+            }
+
+        createdAt_ms = int(lm_obj.get('createdAt') or to_millis(None))
+        lm_obj['createdAt'] = createdAt_ms
+        out_file = outdir / f"{createdAt_ms}.conversation.json"
+        out_file.write_text(json.dumps(lm_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+
+        if args.verbose:
+            print(f"  -> wrote {out_file.name}  messages={len(lm_obj.get('messages', []))}")
 
 if __name__ == "__main__":
     main()

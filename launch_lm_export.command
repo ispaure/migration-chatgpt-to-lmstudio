@@ -46,7 +46,7 @@ pip install -r "$SCRIPT_DIR/Python/requirements.txt"
 
 # Launch the main script
 echo "Executing Migration Script"
-python "$SCRIPT_DIR/Python/lm_export.py" $SCRIPT_DIR/conversations.json --clean --lm --lm-only
+python "$SCRIPT_DIR/Python/lm_export.py" $SCRIPT_DIR/conversations.json --clean --verbose
 
 deactivate
 echo "Script execution complete."

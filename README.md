@@ -1,6 +1,6 @@
 # Migrate ChatGPT Conversations to LM Studio
 
-This script converts a `conversations.json` export from ChatGPT into **LM Studio–compatible** conversation files.  
+This script converts a `conversations.json` export from ChatGPT's website into **LM Studio–compatible** conversation files.  
 Each conversation is written as `<timestamp>.conversation.json` in the LM Studio format so that they can be directly moved to the `conversations` folder of LM Studio.
 
 ---

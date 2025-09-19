@@ -16,9 +16,33 @@ import argparse
 import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
+import re
+import unicodedata
 
 # Default model name to stamp into files (requested)
 DEFAULT_MODEL_NAME = "qwen2.5-vl-72b-instruct"
+
+P_PRIVATE_USE = re.compile(r'[\uE000-\uF8FF]')  # Private Use Area
+P_BRACKETED_REFS = re.compile(r'【[^】]*】')      # e.g.,
+P_ZERO_WIDTH = re.compile(r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]')
+
+
+def sanitize_text(s: str) -> str:
+    if not s:
+        return s
+    # Normalize, then strip our usual offenders
+    s = unicodedata.normalize("NFKC", s)
+    s = P_PRIVATE_USE.sub('', s)
+    s = P_BRACKETED_REFS.sub('', s)
+    s = P_ZERO_WIDTH.sub('', s)
+    # Trim some double spaces left over after removals
+    s = re.sub(r' {2,}', ' ', s)
+    # Optional: collapse stray space before punctuation
+    s = re.sub(r'\s+([,.:;!?\)])', r'\1', s)
+    # Optional: tidy up multiple blank lines
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
 
 def to_millis(ts: Optional[float]) -> int:
     if ts is None:
@@ -93,7 +117,9 @@ def minimal_gen_info() -> Dict[str, Any]:
         }
     }
 
+
 def normalize_user_single_step(text: str) -> Dict[str, Any]:
+    text = sanitize_text(text)
     return {
         "versions": [
             {
@@ -105,13 +131,15 @@ def normalize_user_single_step(text: str) -> Dict[str, Any]:
         "currentlySelected": 0
     }
 
+
 def normalize_assistant_multistep(steps_texts: List[str], step_id_func) -> Dict[str, Any]:
     steps = []
-    for _ in steps_texts:
+    for raw in steps_texts:
+        text = sanitize_text(raw)
         steps.append({
             "type": "contentBlock",
             "stepIdentifier": step_id_func(),
-            "content": [ lm_text_block(_) ],
+            "content": [ lm_text_block(text) ],
             "defaultShouldIncludeInContext": True,
             "shouldIncludeInContext": True,
             "genInfo": minimal_gen_info()
@@ -239,15 +267,10 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
     return lm
 
 def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
-    """
-    Input already looks like LM JSON (has messages). Normalize shapes so LM Studio won't blank out.
-    Ensures unique step IDs, non-empty senderName, lastUsedModel, and minimal genInfo on steps.
-    """
     title = conversation.get("name") or conversation.get("title") or ""
     createdAt_ms = to_millis(conversation.get("createdAt") or conversation.get("create_time"))
-    sys_prompt = conversation.get("systemPrompt", "") or conversation.get("system_prompt", "") or ""
+    sys_prompt = sanitize_text(conversation.get("systemPrompt", "") or conversation.get("system_prompt", "") or "")
 
-    # Unique step id generator here too
     _step_idx = 0
     def next_step_id():
         nonlocal _step_idx
@@ -283,10 +306,11 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
                     text = cont[0].get("text", "")
                 elif isinstance(cont, list) and cont and isinstance(cont[0], str):
                     text = cont[0]
+                text = sanitize_text(text or "")
                 fixed_steps.append({
                     "type": "contentBlock",
                     "stepIdentifier": s.get("stepIdentifier") or next_step_id(),
-                    "content": [ lm_text_block(text or "") ],
+                    "content": [ lm_text_block(text) ],
                     "defaultShouldIncludeInContext": True,
                     "shouldIncludeInContext": True,
                     "genInfo": s.get("genInfo") or minimal_gen_info()
@@ -307,6 +331,7 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
                 "currentlySelected": 0
             })
 
+    # Ensure perChatPredictionConfig has sane defaults
     per_chat = conversation.get("perChatPredictionConfig") or {"fields": []}
     if not per_chat.get("fields"):
         per_chat = {
@@ -316,6 +341,7 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
             ]
         }
 
+    # Ensure lastUsedModel has identifiers
     last_used = conversation.get("lastUsedModel") or {}
     if not last_used.get("identifier"):
         last_used["identifier"] = DEFAULT_MODEL_NAME
@@ -347,7 +373,7 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
         "looseFiles": conversation.get("looseFiles", [])
     }
 
-    # simple token recount
+    # Recompute token count
     approx_chars = 0
     for m in lm["messages"]:
         v = m["versions"][0]
@@ -360,6 +386,7 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
     if verbose:
         print(f"[normalize] {title!r}: in_msgs={len(msgs)} out_msgs={len(out_msgs)}")
     return lm
+
 
 def filter_conversations(conversations: List[Dict[str, Any]], target_id: Optional[str], keywords: Optional[List[str]]) -> List[Dict[str, Any]]:
     if target_id:

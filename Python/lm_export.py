@@ -9,12 +9,16 @@ Usage:
   python lm_export.py conversations.json --clean
   python lm_export.py conversations.json --id <conv-id> --keywords foo bar --verbose
 """
+
 import json
 from pathlib import Path
 import argparse
 import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
+
+# Default model name to stamp into files (requested)
+DEFAULT_MODEL_NAME = "qwen2.5-vl-72b-instruct"
 
 def to_millis(ts: Optional[float]) -> int:
     if ts is None:
@@ -61,37 +65,64 @@ def text_from_content_obj(content_obj: Any, max_len: int = 2_000_000) -> str:
             break
     return "\n\n".join(out_parts)
 
+def lm_text_block(text: str) -> Dict[str, Any]:
+    # Matches LM Studio’s text blocks closely
+    return {
+        "type": "text",
+        "text": text,
+        "fromDraftModel": False,
+        "isStructural": False
+    }
+
+def minimal_gen_info() -> Dict[str, Any]:
+    # Safe, minimal genInfo stub seen in LM files
+    return {
+        "indexedModelIdentifier": DEFAULT_MODEL_NAME,
+        "identifier": DEFAULT_MODEL_NAME,
+        "loadModelConfig": {"fields": []},
+        "predictionConfig": {"fields": []},
+        "stats": {
+            "stopReason": "eosFound",
+            "tokensPerSecond": 0.0,
+            "numGpuLayers": -1,
+            "timeToFirstTokenSec": 0.0,
+            "totalTimeSec": 0.0,
+            "promptTokensCount": 0,
+            "predictedTokensCount": 0,
+            "totalTokensCount": 0
+        }
+    }
+
 def normalize_user_single_step(text: str) -> Dict[str, Any]:
     return {
         "versions": [
             {
                 "type": "singleStep",
                 "role": "user",
-                "content": [
-                    { "type": "text", "text": text }
-                ]
+                "content": [ lm_text_block(text) ]
             }
         ],
         "currentlySelected": 0
     }
 
-def normalize_assistant_multistep(steps_texts: List[str], sender_name: str, step_id_func) -> Dict[str, Any]:
+def normalize_assistant_multistep(steps_texts: List[str], step_id_func) -> Dict[str, Any]:
     steps = []
     for _ in steps_texts:
         steps.append({
             "type": "contentBlock",
             "stepIdentifier": step_id_func(),
-            "content": [ { "type": "text", "text": _ } ],
+            "content": [ lm_text_block(_) ],
             "defaultShouldIncludeInContext": True,
-            "shouldIncludeInContext": True
+            "shouldIncludeInContext": True,
+            "genInfo": minimal_gen_info()
         })
     return {
         "versions": [
             {
                 "type": "multiStep",
                 "role": "assistant",
-                "steps": steps,
-                "senderInfo": { "senderName": sender_name or "" }
+                "senderInfo": { "senderName": DEFAULT_MODEL_NAME },
+                "steps": steps
             }
         ],
         "currentlySelected": 0
@@ -99,7 +130,7 @@ def normalize_assistant_multistep(steps_texts: List[str], sender_name: str, step
 
 def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     title = conversation.get('title') or conversation.get('name') or ""
-    createdAt_ms = to_millis(conversation.get('create_time') or conversation.get('createdAt'))
+    createdAt_ms = to_millis(conversation.get('create_time') or conversation.get('CreatedAt') or conversation.get('createdAt'))
     mapping = conversation.get('mapping') or {}
 
     # Unique step id generator for this conversation
@@ -124,8 +155,9 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
         sys_candidates.sort(key=lambda x: x[0])
         system_prompt = sys_candidates[0][1]
 
-    items: List[Tuple[int, str, str, Dict[str, Any]]] = []  # (ts_ms, role, text, meta)
-    for node_id, node in mapping.items():
+    # Collect visible items
+    items: List[Tuple[int, str, str]] = []  # (ts_ms, role, text)
+    for node in mapping.values():
         if not isinstance(node, dict):
             continue
         msg = node.get('message')
@@ -139,28 +171,25 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
         if not text.strip():
             continue
         ts_ms = to_millis(msg.get('create_time') or 0)
-        items.append((ts_ms, role.lower() if isinstance(role, str) else 'user', text, meta))
+        items.append((ts_ms, role.lower() if isinstance(role, str) else 'user', text))
 
     items.sort(key=lambda x: (x[0], x[1]))
 
+    # Build messages (group consecutive assistants)
     messages: List[Dict[str, Any]] = []
     i = 0
     while i < len(items):
-        _, role, text, meta = items[i]
+        _, role, text = items[i]
         if role == "user":
             messages.append(normalize_user_single_step(text))
             i += 1
         elif role == "assistant":
-            # group consecutive assistant segments as one multiStep
             steps_texts: List[str] = []
-            sender_name = meta.get("model_slug") or ""
             while i < len(items) and items[i][1] == "assistant":
-                _, _, t2, meta2 = items[i]
+                _, _, t2 = items[i]
                 steps_texts.append(t2)
-                if not sender_name:
-                    sender_name = meta2.get("model_slug") or ""
                 i += 1
-            messages.append(normalize_assistant_multistep(steps_texts, sender_name, next_step_id))
+            messages.append(normalize_assistant_multistep(steps_texts, next_step_id))
         else:
             i += 1
 
@@ -173,11 +202,21 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
         "systemPrompt": system_prompt or conversation.get("system_prompt", "") or "",
         "messages": messages,
         "usePerChatPredictionConfig": True,
-        "perChatPredictionConfig": {"fields": []},
+        "perChatPredictionConfig": {
+            "fields": [
+                {"key": "llm.prediction.temperature", "value": 0.7},
+                {"key": "llm.prediction.systemPrompt", "value": system_prompt or ""}
+            ]
+        },
         "clientInput": "",
         "clientInputFiles": [],
         "userFilesSizeBytes": 0,
-        "lastUsedModel": conversation.get("lastUsedModel", {}),
+        "lastUsedModel": {
+            "identifier": DEFAULT_MODEL_NAME,
+            "indexedModelIdentifier": DEFAULT_MODEL_NAME,
+            "instanceLoadTimeConfig": {"fields": []},
+            "instanceOperationTimeConfig": {"fields": []}
+        },
         "notes": conversation.get("notes", []),
         "plugins": conversation.get("plugins", []),
         "pluginConfigs": conversation.get("pluginConfigs", {}),
@@ -201,7 +240,8 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
 
 def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     """
-    Input already looks like LM JSON (has messages). We normalize shapes so LM Studio won't blank out.
+    Input already looks like LM JSON (has messages). Normalize shapes so LM Studio won't blank out.
+    Ensures unique step IDs, non-empty senderName, lastUsedModel, and minimal genInfo on steps.
     """
     title = conversation.get("name") or conversation.get("title") or ""
     createdAt_ms = to_millis(conversation.get("createdAt") or conversation.get("create_time"))
@@ -217,7 +257,8 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
 
     out_msgs: List[Dict[str, Any]] = []
     msgs = conversation.get("messages", [])
-    for idx, m in enumerate(msgs):
+
+    for m in msgs:
         versions = m.get("versions", [])
         if not versions:
             continue
@@ -233,7 +274,6 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
                 text = content[0]
             out_msgs.append(normalize_user_single_step(text or ""))
         else:
-            # ensure it's multiStep with steps[]
             steps = v0.get("steps") or []
             fixed_steps = []
             for s in steps:
@@ -246,21 +286,45 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
                 fixed_steps.append({
                     "type": "contentBlock",
                     "stepIdentifier": s.get("stepIdentifier") or next_step_id(),
-                    "content": [ { "type": "text", "text": text or "" } ],
+                    "content": [ lm_text_block(text or "") ],
                     "defaultShouldIncludeInContext": True,
-                    "shouldIncludeInContext": True
+                    "shouldIncludeInContext": True,
+                    "genInfo": s.get("genInfo") or minimal_gen_info()
                 })
+            sender_info = v0.get("senderInfo") or {"senderName": DEFAULT_MODEL_NAME}
+            if not sender_info.get("senderName"):
+                sender_info["senderName"] = DEFAULT_MODEL_NAME
+
             out_msgs.append({
                 "versions": [
                     {
                         "type": "multiStep",
                         "role": "assistant",
-                        "steps": fixed_steps,
-                        "senderInfo": v0.get("senderInfo") or {"senderName": ""}
+                        "senderInfo": sender_info,
+                        "steps": fixed_steps
                     }
                 ],
                 "currentlySelected": 0
             })
+
+    per_chat = conversation.get("perChatPredictionConfig") or {"fields": []}
+    if not per_chat.get("fields"):
+        per_chat = {
+            "fields": [
+                {"key": "llm.prediction.temperature", "value": 0.7},
+                {"key": "llm.prediction.systemPrompt", "value": sys_prompt}
+            ]
+        }
+
+    last_used = conversation.get("lastUsedModel") or {}
+    if not last_used.get("identifier"):
+        last_used["identifier"] = DEFAULT_MODEL_NAME
+    if not last_used.get("indexedModelIdentifier"):
+        last_used["indexedModelIdentifier"] = DEFAULT_MODEL_NAME
+    if "instanceLoadTimeConfig" not in last_used:
+        last_used["instanceLoadTimeConfig"] = {"fields": []}
+    if "instanceOperationTimeConfig" not in last_used:
+        last_used["instanceOperationTimeConfig"] = {"fields": []}
 
     lm = {
         "name": title,
@@ -271,11 +335,11 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
         "systemPrompt": sys_prompt,
         "messages": out_msgs,
         "usePerChatPredictionConfig": bool(conversation.get("usePerChatPredictionConfig", True)),
-        "perChatPredictionConfig": conversation.get("perChatPredictionConfig", {"fields": []}),
+        "perChatPredictionConfig": per_chat,
         "clientInput": conversation.get("clientInput", ""),
         "clientInputFiles": conversation.get("clientInputFiles", []),
         "userFilesSizeBytes": int(conversation.get("userFilesSizeBytes", 0)),
-        "lastUsedModel": conversation.get("lastUsedModel", {}),
+        "lastUsedModel": last_used,
         "notes": conversation.get("notes", []),
         "plugins": conversation.get("plugins", []),
         "pluginConfigs": conversation.get("pluginConfigs", {}),
@@ -387,11 +451,21 @@ def main():
                 "systemPrompt": "",
                 "messages": [],
                 "usePerChatPredictionConfig": True,
-                "perChatPredictionConfig": {"fields": []},
+                "perChatPredictionConfig": {
+                    "fields": [
+                        {"key": "llm.prediction.temperature", "value": 0.7},
+                        {"key": "llm.prediction.systemPrompt", "value": ""}
+                    ]
+                },
                 "clientInput": "",
                 "clientInputFiles": [],
                 "userFilesSizeBytes": 0,
-                "lastUsedModel": {},
+                "lastUsedModel": {
+                    "identifier": DEFAULT_MODEL_NAME,
+                    "indexedModelIdentifier": DEFAULT_MODEL_NAME,
+                    "instanceLoadTimeConfig": {"fields": []},
+                    "instanceOperationTimeConfig": {"fields": []}
+                },
                 "notes": [],
                 "plugins": [],
                 "pluginConfigs": {},

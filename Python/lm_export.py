@@ -28,7 +28,7 @@ def to_millis(ts: Optional[float]) -> int:
 def text_from_content_obj(content_obj: Any, max_len: int = 2_000_000) -> str:
     """
     Robust, non-recursive collector with size guard to avoid hangs.
-    Collects strings from chatgpt content shapes and joins with double newlines.
+    Collects strings from ChatGPT content shapes and joins with double newlines.
     """
     stack = [content_obj]
     out_parts: List[str] = []
@@ -43,7 +43,6 @@ def text_from_content_obj(content_obj: Any, max_len: int = 2_000_000) -> str:
                 out_parts.append(s)
                 seen += len(s)
         elif isinstance(obj, dict):
-            # Common ChatGPT shape
             if 'parts' in obj and isinstance(obj['parts'], list):
                 for p in reversed(obj['parts']):
                     stack.append(p)
@@ -76,14 +75,13 @@ def normalize_user_single_step(text: str) -> Dict[str, Any]:
         "currentlySelected": 0
     }
 
-def normalize_assistant_multistep(steps_texts: List[str], sender_name: str = "") -> Dict[str, Any]:
+def normalize_assistant_multistep(steps_texts: List[str], sender_name: str, step_id_func) -> Dict[str, Any]:
     steps = []
-    now_ms = to_millis(None)
-    for idx, t in enumerate(steps_texts):
+    for _ in steps_texts:
         steps.append({
             "type": "contentBlock",
-            "stepIdentifier": f"{now_ms}-{idx}",
-            "content": [ { "type": "text", "text": t } ],
+            "stepIdentifier": step_id_func(),
+            "content": [ { "type": "text", "text": _ } ],
             "defaultShouldIncludeInContext": True,
             "shouldIncludeInContext": True
         })
@@ -103,6 +101,14 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
     title = conversation.get('title') or conversation.get('name') or ""
     createdAt_ms = to_millis(conversation.get('create_time') or conversation.get('createdAt'))
     mapping = conversation.get('mapping') or {}
+
+    # Unique step id generator for this conversation
+    _step_idx = 0
+    def next_step_id():
+        nonlocal _step_idx
+        sid = f"{createdAt_ms}-{_step_idx}"
+        _step_idx += 1
+        return sid
 
     # Extract a system prompt if present (first visible, non-empty system msg)
     system_prompt = ""
@@ -140,7 +146,7 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
     messages: List[Dict[str, Any]] = []
     i = 0
     while i < len(items):
-        ts, role, text, meta = items[i]
+        _, role, text, meta = items[i]
         if role == "user":
             messages.append(normalize_user_single_step(text))
             i += 1
@@ -154,9 +160,8 @@ def build_from_mapping(conversation: Dict[str, Any], verbose: bool = False) -> D
                 if not sender_name:
                     sender_name = meta2.get("model_slug") or ""
                 i += 1
-            messages.append(normalize_assistant_multistep(steps_texts, sender_name))
+            messages.append(normalize_assistant_multistep(steps_texts, sender_name, next_step_id))
         else:
-            # ignore other roles
             i += 1
 
     lm: Dict[str, Any] = {
@@ -202,12 +207,19 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
     createdAt_ms = to_millis(conversation.get("createdAt") or conversation.get("create_time"))
     sys_prompt = conversation.get("systemPrompt", "") or conversation.get("system_prompt", "") or ""
 
+    # Unique step id generator here too
+    _step_idx = 0
+    def next_step_id():
+        nonlocal _step_idx
+        sid = f"{createdAt_ms}-{_step_idx}"
+        _step_idx += 1
+        return sid
+
     out_msgs: List[Dict[str, Any]] = []
     msgs = conversation.get("messages", [])
     for idx, m in enumerate(msgs):
         versions = m.get("versions", [])
         if not versions:
-            # drop empty message shells
             continue
         v0 = versions[0]
         vtype = v0.get("type")
@@ -233,7 +245,7 @@ def normalize_existing_lm(conversation: Dict[str, Any], verbose: bool = False) -
                     text = cont[0]
                 fixed_steps.append({
                     "type": "contentBlock",
-                    "stepIdentifier": s.get("stepIdentifier") or f"{createdAt_ms}-{idx}",
+                    "stepIdentifier": s.get("stepIdentifier") or next_step_id(),
                     "content": [ { "type": "text", "text": text or "" } ],
                     "defaultShouldIncludeInContext": True,
                     "shouldIncludeInContext": True
@@ -297,7 +309,6 @@ def filter_conversations(conversations: List[Dict[str, Any]], target_id: Optiona
         if any(kw in title for kw in lower_kws):
             out.append(c)
             continue
-        # quick content scan (mapping only)
         mapping = c.get('mapping') or {}
         blob = ""
         for entry in mapping.values():
@@ -344,7 +355,6 @@ def main():
     if isinstance(data, list):
         conversations = filter_conversations(data, args.id, args.keywords)
     elif isinstance(data, dict):
-        # Wrap single conversation dict to reuse loop
         conversations = [data]
     else:
         print("Error: input must be a JSON array or a single conversation object.")
@@ -368,7 +378,6 @@ def main():
         elif has_messages:
             lm_obj = normalize_existing_lm(conv, verbose=args.verbose)
         else:
-            # Nothing recognizable; make a minimal empty shell so we don't hang
             lm_obj = {
                 "name": conv.get("title") or conv.get("name") or "",
                 "pinned": False,

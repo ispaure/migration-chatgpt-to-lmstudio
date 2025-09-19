@@ -78,6 +78,77 @@ def to_millis(ts: Optional[float]) -> int:
         return int(round(datetime.now().timestamp() * 1000))
     return int(tsf) if tsf > 1e12 else int(round(tsf * 1000))
 
+# --- NEW HELPERS: set file times from source timestamps -----------------------
+def to_seconds(ts: Optional[float]) -> float:
+    """Return timestamp in seconds as float. Accepts sec or ms."""
+    if ts is None:
+        return float(datetime.now().timestamp())
+    try:
+        tsf = float(ts)
+    except Exception:
+        return float(datetime.now().timestamp())
+    return tsf if tsf < 1e12 else tsf / 1000.0
+
+def set_file_times(path: Path, created_ts: Optional[float], updated_ts: Optional[float]) -> None:
+    """
+    Set file modified/access time from updated_ts. On Windows, also try to set creation time.
+    Silent best-effort; no exceptions bubble up.
+    """
+    try:
+        mtime = to_seconds(updated_ts if updated_ts is not None else created_ts)
+        atime = mtime
+        os.utime(path, (atime, mtime))
+    except Exception:
+        pass
+
+    # Try to set creation time on Windows only
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            FILE_WRITE_ATTRIBUTES = 0x0100
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            CreateFileW = ctypes.windll.kernel32.CreateFileW
+            CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            CreateFileW.restype = wintypes.HANDLE
+
+            hFile = CreateFileW(str(path), FILE_WRITE_ATTRIBUTES, 0, None, OPEN_EXISTING, 0, None)
+            if hFile == INVALID_HANDLE_VALUE:
+                return
+
+            def _pytime_to_FILETIME(sec: Optional[float]):
+                if sec is None:
+                    return None
+                ft = int((sec + 11644473600) * 10_000_000)  # seconds -> 100ns + epoch offset
+                return wintypes.FILETIME(ft & 0xFFFFFFFF, ft >> 32)
+
+            mtime_sec = to_seconds(updated_ts if updated_ts is not None else created_ts)
+            cft = _pytime_to_FILETIME(to_seconds(created_ts))
+            aft = _pytime_to_FILETIME(mtime_sec)
+            mft = _pytime_to_FILETIME(mtime_sec)
+
+            SetFileTime = ctypes.windll.kernel32.SetFileTime
+            SetFileTime.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(wintypes.FILETIME),
+                                    ctypes.POINTER(wintypes.FILETIME),
+                                    ctypes.POINTER(wintypes.FILETIME)]
+            SetFileTime.restype = wintypes.BOOL
+
+            SetFileTime(hFile,
+                        ctypes.byref(cft) if cft else None,
+                        ctypes.byref(aft) if aft else None,
+                        ctypes.byref(mft) if mft else None)
+
+            ctypes.windll.kernel32.CloseHandle(hFile)
+        except Exception:
+            pass
+# -----------------------------------------------------------------------------
+
+
 def text_from_content_obj(content_obj: Any, max_len: int = 2_000_000) -> str:
     """
     Robust, non-recursive collector with size guard to avoid hangs.
@@ -547,6 +618,11 @@ def main():
         dest_dir.mkdir(parents=True, exist_ok=True)
         out_file = dest_dir / f"{createdAt_ms}.conversation.json"
         out_file.write_text(json.dumps(lm_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+
+        # NEW: stamp file times from source conversation (creation & update)
+        src_create = conv.get('create_time') or conv.get('createdAt')
+        src_update = conv.get('update_time') or conv.get('updatedAt') or src_create
+        set_file_times(out_file, src_create, src_update)
 
         if args.verbose:
             print(f"  -> wrote {folder}/{out_file.name} (name={lm_obj['name']!r})  messages={len(lm_obj.get('messages', []))}")

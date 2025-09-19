@@ -17,6 +17,7 @@ import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
 import re
+import os
 import unicodedata
 
 # Default model name to stamp into files (requested)
@@ -25,6 +26,30 @@ DEFAULT_MODEL_NAME = "qwen2.5-vl-72b-instruct"
 P_PRIVATE_USE = re.compile(r'[\uE000-\uF8FF]')  # Private Use Area
 P_BRACKETED_REFS = re.compile(r'【[^】]*】')      # e.g.,
 P_ZERO_WIDTH = re.compile(r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]')
+DOLLAR_PREFIX_RE = re.compile(r'^\s*\$([A-Za-z0-9 _.-]+)\$\s*(.*)$')
+
+
+def parse_dollar_prefix(title: str):
+    """
+    If the title starts with $folder$..., return (folder, clean_title).
+    Otherwise return (None, title).
+    """
+    if not isinstance(title, str):
+        return None, title or ""
+    m = DOLLAR_PREFIX_RE.match(title)
+    if not m:
+        return None, title.strip()
+    folder = m.group(1).strip()
+    clean_title = m.group(2).strip()
+    return folder, clean_title or title.strip()
+
+
+def sanitize_folder_name(name: str) -> str:
+    # keep it simple but safe for filesystem
+    s = name.strip().replace(os.sep, "_")
+    s = re.sub(r'[<>:"|?*\0]', '_', s)
+    s = re.sub(r'\s{2,}', ' ', s)
+    return s or "Uncategorized"
 
 
 def sanitize_text(s: str) -> str:
@@ -464,11 +489,13 @@ def main():
             name = conv.get("title") or conv.get("name") or ""
             print(f"[{idx+1}/{len(conversations)}] title={name!r} mapping={has_mapping} messages={has_messages}")
 
+        # Build LM Studio object
         if has_mapping:
             lm_obj = build_from_mapping(conv, verbose=args.verbose)
         elif has_messages:
             lm_obj = normalize_existing_lm(conv, verbose=args.verbose)
         else:
+            # Minimal empty conversation fallback
             lm_obj = {
                 "name": conv.get("title") or conv.get("name") or "",
                 "pinned": False,
@@ -500,13 +527,30 @@ def main():
                 "looseFiles": []
             }
 
+        # Ensure createdAt is an int ms
         createdAt_ms = int(lm_obj.get('createdAt') or to_millis(None))
         lm_obj['createdAt'] = createdAt_ms
-        out_file = outdir / f"{createdAt_ms}.conversation.json"
+
+        # --- Dollar-prefix folder routing ---
+        # Use the *original* title to extract $tag$; then strip it from the LM title
+        raw_title = (conv.get("title") or conv.get("name") or "").strip()
+        folder, clean_title = parse_dollar_prefix(raw_title)
+        if folder:
+            folder = sanitize_folder_name(folder)
+            # strip the $tag$ from what LM Studio displays
+            lm_obj["name"] = clean_title
+        else:
+            folder = "Uncategorized"
+
+        # Write file to <outdir>/<folder>/<createdAt>.conversation.json
+        dest_dir = outdir / folder
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_file = dest_dir / f"{createdAt_ms}.conversation.json"
         out_file.write_text(json.dumps(lm_obj, ensure_ascii=False, indent=2), encoding='utf-8')
 
         if args.verbose:
-            print(f"  -> wrote {out_file.name}  messages={len(lm_obj.get('messages', []))}")
+            print(f"  -> wrote {folder}/{out_file.name} (name={lm_obj['name']!r})  messages={len(lm_obj.get('messages', []))}")
+
 
 if __name__ == "__main__":
     main()

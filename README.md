@@ -8,11 +8,9 @@ Each conversation is written as `<timestamp>.conversation.json` in the LM Studio
 ## Features
 
 - ✅ Converts ChatGPT’s `mapping` structure into LM Studio’s `messages` format.
-- ✅ Preserves user and assistant messages.  
-- ✅ Cleans up artifacts like ` … ` and citation markers ` `.  
-- ✅ Ensures unique `stepIdentifier` values for assistant steps.  
+- ✅ Preserves ALL user and assistant messages.  
+- ✅ Timestamps the conversation files to keep proper ordering (LM Studio orders conversation from newest created to oldest created)
 - ✅ Supports `$tag$` prefixes in titles to auto-sort into subfolders (e.g. `$tech$GPU Notes` → `tech/…` with title cleaned). These need to be added manually on ChatGPT before the `conversations.json` export.  
-- ✅ No external dependencies — pure Python standard library.
 - ✅ Windows and macOS support (launch_lm_export.bat / launch_lm_export.command)
 
 ---

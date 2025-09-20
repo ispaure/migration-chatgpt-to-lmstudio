@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Tuple, Optional
 import re
 import os
 import unicodedata
+from typing import *
+import sys
+from enum import Enum
 
 # Default model name to stamp into files (requested)
 DEFAULT_MODEL_NAME = "qwen2.5-vl-72b-instruct"
@@ -27,6 +30,74 @@ P_PRIVATE_USE = re.compile(r'[\uE000-\uF8FF]')  # Private Use Area
 P_BRACKETED_REFS = re.compile(r'【[^】]*】')      # e.g.,
 P_ZERO_WIDTH = re.compile(r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]')
 DOLLAR_PREFIX_RE = re.compile(r'^\s*\$([A-Za-z0-9 _.-]+)\$\s*(.*)$')
+
+
+def get_output_dir(outdir: str) -> Path:
+    if outdir == 'within-lmstudio-conversations-folder':
+        home_pointer_path = Path(get_user_home_dir(), '.lmstudio-home-pointer')
+        if not os.path.isfile(home_pointer_path):
+            print(f'Missing file at location {home_pointer_path}. Please use arg --outdir to specify your output directory manually.')
+            sys.exit()
+        else:
+            lines_lst = read_file(home_pointer_path)
+            if len(lines_lst) <= 0:
+                print(f'.lmstudio-home-pointer file is missing path. Please use arg --outdir to specify your output directory manually.')
+                sys.exit()
+            else:
+                lm_studio_user_dir_path = Path(lines_lst[0])
+                if not os.path.isdir(lm_studio_user_dir_path):
+                    print(f'.lmstudio folder missing at expected path specified in .lmstudio-home-pointer file. Please use arg --outdir to specify your output directory manually.')
+                    sys.exit()
+                else:
+                    date_time_str = "2024-01-02 (11:15:47)"
+                    date_time_format = "%Y-%m-%d (%H:%M:%S)"
+                    date_time_obj = str(datetime.strptime(date_time_str, date_time_format))
+                    return Path(lm_studio_user_dir_path, 'conversations', f'ChatGPT Imports - {date_time_obj}')
+    else:
+        return Path(outdir)
+
+
+def get_user_home_dir() -> Path:
+    """
+    Get the current user's home directory
+    """
+    match get_os():
+        case OS.WIN | OS.MAC:
+            return Path.home()
+        case OS.LINUX:  # Will work even if using sudo
+            user = os.getenv("SUDO_USER") or os.getenv("USER")  # Prefer real user
+            home_dir = Path(pwd.getpwnam(user).pw_dir if user else os.path.expanduser("~"))
+            return home_dir
+
+
+class OS(Enum):
+    WIN = "Windows"
+    MAC = "macOS"
+    LINUX = "Linux"
+    UNKNOWN = "Unknown"
+
+
+def get_os() -> OS:
+    match sys.platform:
+        case 'win32':
+            return OS.WIN
+        case 'darwin':
+            return OS.MAC
+        case 'linux':
+            return OS.LINUX
+        case _:
+            return OS.UNKNOWN
+
+
+def read_file(file_path: Union[str, Path]):
+    """
+    Returns each line of a text file as part of a list.
+    :param file_path: File path to read
+    :type file_path: str
+    :rtype: lst
+    """
+    f = open(file_path, 'r', encoding='utf-8-sig')
+    return f.read().splitlines()
 
 
 def parse_dollar_prefix(title: str):
@@ -523,7 +594,7 @@ def main():
     parser.add_argument('--id', help='Only process this conversation ID (when input is an array)')
     parser.add_argument('--keywords', nargs='*', help='Only conversations containing these keywords (title or content)')
     parser.add_argument('--clean', action='store_true', help='Delete output directory before extracting')
-    parser.add_argument('--outdir', default='lm_conversations_lmstudio', help='Output directory')
+    parser.add_argument('--outdir', default='within-lmstudio-conversations-folder', help='Output directory')
     parser.add_argument('--verbose', action='store_true', help='Verbose logging')
     args = parser.parse_args()
 
@@ -547,7 +618,7 @@ def main():
         print("Error: input must be a JSON array or a single conversation object.")
         return
 
-    outdir = Path(args.outdir)
+    outdir = get_output_dir(args.outdir)
     if args.clean and outdir.exists():
         shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

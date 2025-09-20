@@ -28,11 +28,11 @@ This script converts a `conversations.json` export from ChatGPT's website into *
 - No external libraries required even though a venv is created by the launch script.
 
 ## Arguments
-conversations_file (required): Path to conversations.json file containing an array of conversations from ChatGPT (By default, expected alongside the launch script files)
---id: Process only the conversation with the specified ID (when input contains an array of conversations)
---keywords: Process only conversations containing the specified keywords in either the title or content
---clean: Delete the output directory before processing (useful for fresh exports)
---outdir: Specify output directory path (Default: Within the User's .lmstudio/conversations in a new subfolder -- So it should appear in LM Studio alongside other conversations with no need to move files.)
---verbose: Enable verbose logging output
+- conversations_file (required): Path to conversations.json file containing an array of conversations from ChatGPT (By default, expected alongside the launch script files)
+- --id: Process only the conversation with the specified ID (when input contains an array of conversations)
+- --keywords: Process only conversations containing the specified keywords in either the title or content
+- --clean: Delete the output directory before processing (useful for fresh exports)
+- --outdir: Specify output directory path (Default: Within the User's .lmstudio/conversations in a new subfolder -- So it should appear in LM Studio alongside other conversations with no need to move files.)
+- --verbose: Enable verbose logging output
 
 

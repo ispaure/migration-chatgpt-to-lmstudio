@@ -14,7 +14,7 @@ The converted conversation files are automatically placed in the user's LM Studi
     - Every message exchanged between you and ChatGPT, whether from the user or assistant side, is meticulously preserved during the conversion process.
     - This guarantees that no part of your conversation history is lost in the transition.
 - **✅ Maintains Correct Order with Timestamps**
-    - Each converted conversation file is named in the format expected by LM Studio, such as 1758392316161.conversation.json, where the numeric prefix represents a timestamp.
+    - Each converted conversation file is named in the format expected by LM Studio, such as `1758392316161.conversation.json`, where the numeric prefix represents a timestamp.
     - Additionally, the file’s metadata—specifically its creation and modification times—is timestamped. This ensures that conversations are correctly ordered in LM Studio, with the newest ones appearing first.
 - **✅ Supports `$tag$` Prefixes for Auto-Sorting**
     - You can use `$tag$` prefixes in the titles of your ChatGPT conversations to automatically sort them into subfolders within LM Studio.

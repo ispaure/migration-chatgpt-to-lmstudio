@@ -34,8 +34,8 @@ The converted conversation files are automatically placed in the user's LM Studi
     - Move the `conversations.json` file from the extracted folder to the migration scripts' directory, alongside the launch `.BAT` and `.COMMAND` files.
 4. **Run the Conversion Script**
     - Execute the appropriate launch file for your platform:
-        - **Windows**: Double-click `launch_migration.BAT` file.
-        - **macOS**: Double-click the `launch_migration.COMMAND` file. If the command file refuses to execute, open a terminal window and run `chmod +x <command-file-path>`.
+        - **Windows**: Double-click `run_migration.BAT` file.
+        - **macOS**: Double-click the `run_migration.COMMAND` file. If the command file refuses to execute, open a terminal window and run `chmod +x <command-file-path>`.
     - The script will automatically migrate your conversations to LM Studio's `conversations` subfolder, which is typically located in the user's home directory at `.lmstudio/conversations`. If you have redirected this location using the `.lmstudio-home-pointer` file, the script will handle that as well.
     - Once the conversion is complete, you can close the script window.
 6. **View Your Conversations in LM Studio**

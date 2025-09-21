@@ -60,7 +60,16 @@ This project is licensed under the MIT License - see the `LICENSE.MD` file for d
 ---
 ## Example Output
 
-Here is an example of the output folder structure after running the tool:
+After running the script, you should see a directory structure similar to this:
 
-`.lmstudio/ ├── conversations/ │   └── ChatGPT Imports ➡️ 2025-09-21 (11:54:02) │       ├── tech/ │       │   └── 1758391848906.conversation.json │       ├── 1758392000000.conversation.json │       └── 1758392100000.conversation.json`
-
+```
+📂 User Directory
+└── 📂 .lmstudio
+    └── 📂 conversations
+        └── 📂 ChatGPT Imports - 2025-09-21 (11:54:02)
+            ├── 📂 tech
+            │   └── 📄 1758392316161.conversation.json
+            └── 📂 Uncategorized
+                ├── 📄 1758392316000.conversation.json
+                └── 📄 1758392316001.conversation.json
+```

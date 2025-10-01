@@ -34,7 +34,7 @@ GOTO :setup_venv
 
 :setup_python
 echo Installing Python 3.12.2(x64) ...
-"%~dp0/Software_WIN/python-3.12.2-amd64.exe" /quiet PrependPath=1 Include_test=0 SimpleInstall=1
+"%~dp0/PythonSoftware/python-3.12.2-amd64.exe" /quiet PrependPath=1 Include_test=0 SimpleInstall=1
 echo Installed Python!
 GOTO :setup_venv
 

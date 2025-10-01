@@ -25,21 +25,25 @@ The converted conversation files are automatically placed in the user's LM Studi
 
 ## Instructions
 
-1. **Add Folder Tags (Optional)**
+1. **Download this Repo**
+    - Download this repository (either clone or download the .ZIP file from GitHub and extract files)
+2. **(If using macOS) Install Homebrew**
+    - Install homebrew by typing this in the terminal `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` or refer to the [Homebrew Website](https://brew.sh/)
+3. **Add Folder Tags (Optional)**
     - On the [ChatGPT Website](http://chat.openai.com), set `$tag$` suffixes on notes you want to be nested in subfolders in LM Studio. See features section for an example.
-3. **Export Data from ChatGPT**
+4. **Export Data from ChatGPT**
     - On the [ChatGPT Website](http://chat.openai.com), navigate to `ChatGPT Settings` → `Data Controls` and select Export Data.
-4. **Download and Extract the ZIP File**
+5. **Download and Extract the ZIP File**
     - You will receive an email from ChatGPT with a link containing your data. Download and extract the `.ZIP` file.
-5. **Prepare for Conversion**
-    - Move the `📄conversations.json` file from the extracted folder to the migration scripts' directory, alongside the launch `.BAT` and `.COMMAND` files.
-6. **Run the Conversion Script**
+6. **Prepare for Conversion**
+    - Move the `📄conversations.json` file from the extracted folder to the migration scripts' directory (what you cloned/downloaded from GIT), alongside the launch `.BAT` and `.COMMAND` files.
+7. **Run the Conversion Script**
     - Execute the appropriate launch file for your platform:
         - **Windows**: Double-click `📄run_migration.BAT` file.
         - **macOS**: Double-click the `📄run_migration.COMMAND` file. If the command file refuses to execute, open a terminal window and run `chmod +x <command-file-path>` and try to execute it again.
     - The script will automatically migrate your conversations to LM Studio's `📂conversations` subfolder, which is typically located in the user's home directory at `📂.lmstudio/conversations`. If you have redirected this location using the `📄.lmstudio-home-pointer` file, the script will handle that as well.
     - Once the conversion is complete, you can close the script window.
-7. **View Your Conversations in LM Studio**
+8. **View Your Conversations in LM Studio**
     - Open LM Studio, and you will find all your migrated conversations organized under a `📂ChatGPT Imports - <DateTime>` subfolder.
 
 ## Requirements
